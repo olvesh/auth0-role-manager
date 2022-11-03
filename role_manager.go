@@ -16,40 +16,33 @@ package auth0rolemanager
 
 import (
 	"errors"
-	"fmt"
 
+	"github.com/auth0/go-auth0/management"
 	"github.com/casbin/casbin/log"
 	"github.com/casbin/casbin/rbac"
-	"github.com/casbin/go-auth0/auth0"
 )
 
 type RoleManager struct {
 	clientID     string
 	clientSecret string
-	audience     string
 	tenant       string
-	apiEndpoint  string
 
-	nameToIDMap  map[string]string
-	idToNameMap  map[string]string
+	nameToIDMap map[string]string
+	idToNameMap map[string]string
 
-	mgmtClient   *auth0.Auth0
-	authzClient   *auth0.Auth0
+	mgmtClient *management.Management
+	//authzClient *auth0.Auth0
 }
 
 // NewRoleManager is the constructor of an Auth0 RoleManager instance.
 // clientID is the Client ID.
 // clientSecret is the Client Secret.
 // tenant is your tenant name. If your domain is: abc.auth0.com, then abc is your tenant name.
-// apiEndpoint is the base URL for your Auth0 Authorization Extension, it should
-// be something like: "https://abc.us.webtask.io/adf6e2f2b84784b57522e3b19dfc9201", there is
-// no "/admins", "/admins/login", "/users" or "/api" in the end.
-func NewRoleManager(clientID string, clientSecret string, tenant string, apiEndpoint string) rbac.RoleManager {
+func NewRoleManager(clientID string, clientSecret string, tenant string) rbac.RoleManager {
 	rm := RoleManager{}
 	rm.clientID = clientID
 	rm.clientSecret = clientSecret
 	rm.tenant = tenant
-	rm.apiEndpoint = apiEndpoint
 
 	rm.nameToIDMap = map[string]string{}
 	rm.idToNameMap = map[string]string{}
@@ -64,43 +57,58 @@ func NewRoleManager(clientID string, clientSecret string, tenant string, apiEndp
 }
 
 func (rm *RoleManager) initialize() error {
-	cfg := auth0.Config{
-		ClientID:         rm.clientID,
-		ClientSecret:     rm.clientSecret,
-		Tenant:           rm.tenant,
-		AuthorizationURL: rm.apiEndpoint,
-	}
-
 	var err error
+	rm.mgmtClient, err = management.New(
+		rm.tenant,
+		management.WithClientCredentials(rm.clientID, rm.clientSecret),
+	)
 
-	rm.mgmtClient, err = cfg.ClientFromCredentials(fmt.Sprintf("https://%s.auth0.com/api/v2/", rm.tenant))
-	if err != nil {
-		return err
-	}
+	return err
+}
 
-	rm.authzClient, err = cfg.ClientFromCredentials("urn:auth0-authz-api")
-	if err != nil {
-		return err
-	}
-
-	return nil
+func pager[T any](f func(...management.RequestOption) (T, error), pageNum int) (T, int, error) {
+	list, err := f(management.Page(pageNum), management.PerPage(100))
+	return list, pageNum + 1, err
 }
 
 func (rm *RoleManager) loadMapping() {
 	log.LogPrintf("Loading (ID, name) mapping for users:")
-	users, _ := rm.mgmtClient.Mgmt.Users.GetAll()
-	for _, user := range users {
-		rm.nameToIDMap[user.Email] = user.ID
-		rm.idToNameMap[user.ID] = user.Email
-		log.LogPrintf("%s -> %s", user.ID, user.Email)
+
+	usersFun := rm.mgmtClient.User.List
+	for p := 0; ; p++ {
+		users, _, err := pager(usersFun, p)
+		if err != nil {
+			log.LogPrintf("Error loading users: '%v'", err)
+			return
+		}
+
+		for _, user := range users.Users {
+			rm.nameToIDMap[*user.Email] = *user.ID
+			rm.idToNameMap[*user.ID] = *user.Email
+			log.LogPrintf("%s -> %s", user.ID, user.Email)
+		}
+		if !users.HasNext() {
+			break
+		}
 	}
 
-	log.LogPrintf("Loading (ID, name) mapping for groups:")
-	groups, _ := rm.authzClient.Authz.Groups.GetAll()
-	for _, group := range groups {
-		rm.nameToIDMap[group.Name] = group.ID
-		rm.idToNameMap[group.ID] = group.Name
-		log.LogPrintf("%s -> %s", group.ID, group.Name)
+	log.LogPrintf("Loading (ID, name) mapping for roles:")
+	rolesFun := rm.mgmtClient.Role.List
+	for p := 0; ; p++ {
+		roles, _, err := pager(rolesFun, p)
+		if err != nil {
+			log.LogPrintf("Error loading roles: '%v'", err)
+			return
+		}
+		for _, group := range roles.Roles {
+			rm.nameToIDMap[*group.Name] = *group.ID
+			rm.idToNameMap[*group.ID] = *group.Name
+			log.LogPrintf("%s -> %s", group.ID, group.Name)
+		}
+		if !roles.HasNext() {
+			break
+		}
+
 	}
 }
 
@@ -111,13 +119,21 @@ func (rm *RoleManager) getAuth0UserGroups(name string) ([]string, error) {
 		return nil, errors.New("ID not found for the user")
 	}
 
-	groups, err := rm.authzClient.Authz.Users.GetAllGroups(rm.nameToIDMap[name])
-	if err != nil {
-		return nil, err
+	f := func(opts ...management.RequestOption) (*management.RoleList, error) {
+		return rm.mgmtClient.User.Roles(rm.nameToIDMap[name], opts...)
 	}
 
-	for _,  group := range groups {
-		res = append(res, group.Name)
+	for p := 0; ; p++ {
+		roles, _, err := pager(f, p)
+		if err != nil {
+			return nil, err
+		}
+		for _, role := range roles.Roles {
+			res = append(res, *role.Name)
+		}
+		if !roles.HasNext() {
+			break
+		}
 	}
 	return res, nil
 }
@@ -129,14 +145,23 @@ func (rm *RoleManager) getAuth0GroupUsers(name string) ([]string, error) {
 		return nil, errors.New("ID not found for the role")
 	}
 
-	members, err := rm.authzClient.Authz.Groups.GetMembers(rm.nameToIDMap[name])
-	if err != nil {
-		return nil, err
+	f := func(opts ...management.RequestOption) (*management.UserList, error) {
+		return rm.mgmtClient.Role.Users(rm.nameToIDMap[name], opts...)
+	}
+	for p := 0; ; p++ {
+		users, _, err := pager(f, 0)
+		if err != nil {
+			return nil, err
+		}
+
+		for _, user := range users.Users {
+			res = append(res, *user.Email)
+		}
+		if !users.HasNext() {
+			break
+		}
 	}
 
-	for _,  user := range members.Users {
-		res = append(res, user.Email)
-	}
 	return res, nil
 }
 
@@ -147,13 +172,13 @@ func (rm *RoleManager) Clear() error {
 
 // AddLink adds the inheritance link between role: name1 and role: name2.
 // domain is not used.
-func (rm *RoleManager) AddLink(name1 string, name2 string, domain ...string) error {
+func (rm *RoleManager) AddLink(_ string, _ string, _ ...string) error {
 	return errors.New("not implemented")
 }
 
 // DeleteLink deletes the inheritance link between role: name1 and role: name2.
 // domain is not used.
-func (rm *RoleManager) DeleteLink(name1 string, name2 string, domain ...string) error {
+func (rm *RoleManager) DeleteLink(_ string, _ string, _ ...string) error {
 	return errors.New("not implemented")
 }
 

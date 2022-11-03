@@ -64,8 +64,7 @@ func TestRole(t *testing.T) {
 	rm := NewRoleManager(
 		"your_client_id",
 		"your_client_secret",
-		"your_tenant_name",
-		"your_base_url_for_auth0_authorization_extension")
+		"your_tenant_name")
 
 	// Current role inheritance tree:
 	//            Group1      Admin
@@ -96,8 +95,7 @@ func TestEnforcer(t *testing.T) {
 	rm := NewRoleManager(
 		"your_client_id",
 		"your_client_secret",
-		"your_tenant_name",
-		"your_base_url_for_auth0_authorization_extension")
+		"your_tenant_name")
 	e.SetRoleManager(rm)
 
 	// If our role manager relies on Casbin policy (like reading "g"
